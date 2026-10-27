@@ -16,12 +16,12 @@ import {
   Link2,
   ShieldCheck,
   FileVideo,
-  FileText,
   Zap,
   AlertCircle,
   CheckCircle2,
   ArrowUpLeft,
   ArrowDownRight,
+  Unplug,
 } from 'lucide-react';
 import {
   ConnectionStatus,
@@ -31,10 +31,10 @@ import {
 } from '../types';
 import { FluentCard } from './FluentCard';
 
-// حجم الجزء الواحد (Chunk Size) = 64 كيلوبايت لضمان أعلى سرعة عبر RTCDataChannel مع دعم الإيقاف المؤقت
+// حجم الجزء الواحد (Chunk Size) = 64 كيلوبايت لضمان سرعة نقل عالية واستقرار كامل عبر كافة المتصفحات
 const CHUNK_SIZE = 64 * 1024;
 // بادئة معرف PeerJS لربط رمز الـ PIN المكون من 6 أرقام
-const PEER_PREFIX = 'localshare-p2p-v1-';
+const PEER_PREFIX = 'localshare-p2p-v2-';
 
 interface ConnectionManagerProps {
   onFileReceived: (file: ReceivedFileItem) => void;
@@ -54,6 +54,47 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * تحويل الأرقام العربية المشرقية (٠-٩) أو الفارسية (۰-۹) إلى أرقام إنجليزية قياسية (0-9)
+ * لضمان عمل حقل رمز الـ PIN بسلاسة مع لوحات المفاتيح العربية على الهواتف
+ */
+function normalizePinDigits(input: string): string {
+  return input
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 1632))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 1776))
+    .replace(/\D/g, '')
+    .slice(0, 6);
+}
+
+/**
+ * تحويل ArrayBuffer إلى نص Base64 سريع لضمان توافق نقل البيانات عبر JSON Serialization في جميع المتصفحات
+ */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(
+      null,
+      Array.from(bytes.subarray(i, i + chunkSize))
+    );
+  }
+  return btoa(binary);
+}
+
+/**
+ * تحويل نص Base64 إلى Uint8Array عند الاستقبال
+ */
+function base64ToUint8Array(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/**
  * مكون إدارة الاتصال والنقل المباشر (ConnectionManager)
  * يتولى إقران الأجهزة عبر WebRTC (QR / 6-Digit PIN) وتقسيم الملفات الكبيرة مع دعم الإيقاف المؤقت والاستئناف
  */
@@ -62,10 +103,13 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
   receivedCount,
   onNavigateToFiles,
 }) => {
-  // توليد رمز PIN عشوائي مكون من 6 أرقام لهذا الجهاز
+  // توليد رمز PIN عشوائي مكون من 6 أرقام لهذا الجهاز (يبقى ثابتاً طوال الجلسة)
   const [myPin, setMyPin] = useState<string>(() =>
     Math.floor(100000 + Math.random() * 900000).toString()
   );
+  // عداد داخلي لإعادة تنشيط جلسة الإشارة تلقائياً بنفس رمز الـ PIN عند انقطاع الخادم السحابي
+  const [signalingEpoch, setSignalingEpoch] = useState<number>(0);
+
   const [targetPin, setTargetPin] = useState<string>('');
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [connectedPeerPin, setConnectedPeerPin] = useState<string | null>(null);
@@ -85,11 +129,26 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
   const [transfers, setTransfers] = useState<FileTransferItem[]>([]);
   const [isDragging, setIsDragging] = useState<boolean>(false);
 
+  // مراجع ثابتة لمنع إعادة إنشاء اتصال PeerJS عند تحديث الواجهة
+  const onFileReceivedRef = useRef(onFileReceived);
+  useEffect(() => {
+    onFileReceivedRef.current = onFileReceived;
+  }, [onFileReceived]);
+
+  const myPinRef = useRef(myPin);
+  useEffect(() => {
+    myPinRef.current = myPin;
+  }, [myPin]);
+
   // مراجع WebRTC وقناة الاتصال المحلية
   const peerRef = useRef<Peer | null>(null);
   const connRef = useRef<DataConnection | null>(null);
   const broadcastRef = useRef<BroadcastChannel | null>(null);
   const isLoopbackModeRef = useRef<boolean>(false);
+  const connectTimeoutRef = useRef<number | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const retryCountRef = useRef<number>(0);
+  const pendingConnectPinRef = useRef<string | null>(null);
 
   // مراجع للتحكم في الإيقاف المؤقت والاستئناف وتجميع الأجزاء المستلمة
   const pausedTransfersRef = useRef<Set<string>>(new Set());
@@ -112,7 +171,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // إرسال حزمة بيانات عبر WebRTC أو عبر قناة المحاكاة المحلية عند الاختبار
+  // إرسال حزمة بيانات عبر WebRTC أو عبر قناة المحاكاة المحلية
   const sendPacket = useCallback((packet: SignalingDataPacket) => {
     if (connRef.current && connRef.current.open) {
       connRef.current.send(packet);
@@ -121,11 +180,55 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
     }
   }, []);
 
-  // معالجة الحزم الواردة عبر WebRTC DataChannel
+  // معالجة الحزم الواردة عبر WebRTC DataChannel (دالة ثابتة المرجع لا تسبب قطع الاتصال)
   const handleIncomingData = useCallback(
-    (rawData: unknown) => {
+    (rawData: unknown, sourceConn?: DataConnection) => {
       const packet = rawData as SignalingDataPacket;
       if (!packet || typeof packet !== 'object' || !('type' in packet)) return;
+
+      // معالجة مصافحة الاتصال المباشر (Handshake) لتأكيد الربط الفوري بين الجهازين
+      if (packet.type === 'HANDSHAKE_SYN') {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
+        const remotePin = packet.senderPin || 'جهاز متصل';
+        setStatus('connected');
+        setConnectedPeerPin(remotePin);
+        setStatusMessage(`متصل بنجاح عبر WebRTC بالجهاز رقم (${remotePin})`);
+
+        const ackPacket: SignalingDataPacket = {
+          type: 'HANDSHAKE_ACK',
+          senderPin: myPinRef.current,
+        };
+        if (sourceConn && sourceConn.open) {
+          sourceConn.send(ackPacket);
+        } else {
+          sendPacket(ackPacket);
+        }
+        return;
+      }
+
+      if (packet.type === 'HANDSHAKE_ACK') {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
+        const remotePin = packet.senderPin || 'جهاز متصل';
+        setStatus('connected');
+        setConnectedPeerPin(remotePin);
+        setStatusMessage(`متصل بنجاح عبر WebRTC بالجهاز رقم (${remotePin})`);
+        return;
+      }
+
+      if (packet.type === 'PING') {
+        sendPacket({ type: 'PONG', timestamp: packet.timestamp });
+        return;
+      }
+
+      if (packet.type === 'PONG') {
+        return;
+      }
 
       if (packet.type === 'FILE_META') {
         // بدء استقبال ملف جديد
@@ -160,9 +263,10 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
         const bufferEntry = incomingBuffersRef.current.get(packet.transferId);
         if (!bufferEntry) return;
 
-        // تحويل البيانات الواردة إلى Uint8Array
         let chunkArray: Uint8Array;
-        if (packet.data instanceof ArrayBuffer) {
+        if (typeof packet.data === 'string') {
+          chunkArray = base64ToUint8Array(packet.data);
+        } else if (packet.data instanceof ArrayBuffer) {
           chunkArray = new Uint8Array(packet.data);
         } else if (ArrayBuffer.isView(packet.data)) {
           chunkArray = new Uint8Array(
@@ -170,12 +274,6 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
             packet.data.byteOffset,
             packet.data.byteLength
           );
-        } else if (typeof packet.data === 'string') {
-          const binaryString = atob(packet.data);
-          chunkArray = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            chunkArray[i] = binaryString.charCodeAt(i);
-          }
         } else {
           return;
         }
@@ -211,7 +309,6 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
           )
         );
       } else if (packet.type === 'TRANSFER_CONTROL') {
-        // معالجة أوامر الإيقاف المؤقت أو الاستئناف أو الإلغاء من الطرف الآخر
         if (packet.action === 'PAUSE') {
           pausedTransfersRef.current.add(packet.transferId);
           setTransfers((prev) =>
@@ -263,8 +360,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
           )
         );
 
-        // إضافة الملف المكتمل إلى لوحة إدارة الملفات
-        onFileReceived({
+        onFileReceivedRef.current({
           id: `${packet.transferId}-${Date.now()}`,
           name: bufferEntry.fileName,
           size: bufferEntry.fileSize,
@@ -282,19 +378,178 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
         incomingBuffersRef.current.delete(packet.transferId);
       }
     },
-    [onFileReceived]
+    [sendPacket]
   );
 
-  // إعداد اتصال PeerJS عند تغير رمز الـ PIN المحلي
+  // ربط أحداث قناة البيانات (DataConnection) لكل من المرسل والمستقبل
+  const setupDataConnection = useCallback(
+    (conn: DataConnection, remotePinLabel: string) => {
+      if (connRef.current && connRef.current !== conn) {
+        try {
+          connRef.current.close();
+        } catch {
+          // تجاهل
+        }
+      }
+
+      connRef.current = conn;
+      isLoopbackModeRef.current = false;
+
+      const markAsConnected = () => {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
+        retryCountRef.current = 0;
+        pendingConnectPinRef.current = null;
+        setStatus('connected');
+        setConnectedPeerPin(remotePinLabel);
+        setStatusMessage(`متصل مباشرة عبر WebRTC بالجهاز رقم (${remotePinLabel})`);
+
+        // إرسال رسالة مصافحة لتأكيد الاتصال على الطرفين فوراً
+        try {
+          conn.send({
+            type: 'HANDSHAKE_SYN',
+            senderPin: myPinRef.current,
+          } satisfies SignalingDataPacket);
+        } catch {
+          // تجاهل
+        }
+      };
+
+      if (conn.open) {
+        markAsConnected();
+      } else {
+        conn.on('open', markAsConnected);
+      }
+
+      conn.on('data', (data) => {
+        handleIncomingData(data, conn);
+      });
+
+      conn.on('close', () => {
+        if (connRef.current === conn) {
+          connRef.current = null;
+          setStatus('ready');
+          setConnectedPeerPin(null);
+          setStatusMessage('انتهت جلسة الاتصال مع الجهاز المقابل — جاهز لاتصال جديد');
+        }
+      });
+
+      conn.on('error', () => {
+        if (connRef.current === conn) {
+          setStatus('ready');
+          setStatusMessage('حدث انقطاع في قناة البيانات — يمكنك إعادة الاتصال برمز الـ PIN');
+        }
+      });
+    },
+    [handleIncomingData]
+  );
+
+  // دالة الاتصال بجهاز آخر عبر رمز PIN المكون من 6 أرقام
+  const connectToPeer = useCallback(
+    (pinToConnect?: string, isAutoRetry = false) => {
+      const cleanPin = normalizePinDigits(pinToConnect ?? targetPin);
+      if (cleanPin.length !== 6) {
+        setStatusMessage('يرجى إدخال رمز PIN صحيح مكون من 6 أرقام');
+        return;
+      }
+
+      setTargetPin(cleanPin);
+
+      // إذا أدخل المستخدم نفس رمز جهازه، نفعل وضع النقل المحلي الفوري للاختبار
+      if (cleanPin === myPinRef.current) {
+        isLoopbackModeRef.current = true;
+        setStatus('connected');
+        setConnectedPeerPin(`${cleanPin} (محلي)`);
+        setStatusMessage(
+          'تم تفعيل وضع النقل المحلي الفوري (Loopback P2P) لاختبار السرعة والتقسيم'
+        );
+        return;
+      }
+
+      if (!isAutoRetry) {
+        retryCountRef.current = 0;
+      }
+
+      setStatus('connecting');
+      setStatusMessage(`جاري الاقتران بالجهاز رقم (${cleanPin})...`);
+
+      // 1. محاولة الإقران الفوري عبر BroadcastChannel (إذا كان الجهازان نافذتين على نفس المتصفح)
+      broadcastRef.current?.postMessage({
+        type: 'LOCAL_PAIR_REQUEST',
+        targetPin: cleanPin,
+        senderPin: myPinRef.current,
+      });
+
+      // 2. التحقق من جاهزية كائن PeerJS؛ وإذا كان الخادم السحابي يعيد الاتصال نجدول الطلب تلقائياً
+      const peer = peerRef.current;
+      if (!peer || peer.destroyed || peer.disconnected || !peer.open) {
+        pendingConnectPinRef.current = cleanPin;
+        setSignalingEpoch((e) => e + 1);
+        return;
+      }
+
+      // 3. فتح اتصال WebRTC DataChannel مع تفعيل JSON Serialization لتوافق 100% بين الجوال والكمبيوتر
+      try {
+        const conn = peer.connect(`${PEER_PREFIX}${cleanPin}`, {
+          reliable: true,
+          serialization: 'json',
+        });
+
+        setupDataConnection(conn, cleanPin);
+
+        // مؤقت أمان لإعادة المحاولة تلقائياً إذا تأخر الرد من شبكة الـ NAT
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+        }
+        connectTimeoutRef.current = window.setTimeout(() => {
+          if (connRef.current && !connRef.current.open && !isLoopbackModeRef.current) {
+            if (retryCountRef.current < 2) {
+              retryCountRef.current += 1;
+              setStatusMessage(
+                `جاري إعادة محاولة الربط المباشر بالجهاز (${cleanPin})... (${retryCountRef.current}/2)`
+              );
+              connectToPeer(cleanPin, true);
+            } else {
+              setStatus('ready');
+              setStatusMessage(
+                `تعذر الوصول للجهاز (${cleanPin}) — تأكد من فتح التطبيق على الجهاز الآخر وبقاء شاشته نشطة`
+              );
+            }
+          }
+        }, 7000);
+      } catch {
+        setStatus('ready');
+        setStatusMessage('تعذر بدء الاتصال — يرجى التحقق من رمز الـ PIN والمحاولة مجدداً');
+      }
+    },
+    [targetPin, setupDataConnection]
+  );
+
+  // مرجع لدالة connectToPeer لاستخدامها داخل useEffect دون إعادة تشغيل PeerJS
+  const connectToPeerRef = useRef(connectToPeer);
   useEffect(() => {
-    setStatus('disconnected');
-    setStatusMessage('جاري تسجيل رمز الـ PIN المحلي على خادم الإشارة...');
+    connectToPeerRef.current = connectToPeer;
+  }, [connectToPeer]);
+
+  // إعداد اتصال PeerJS مع تعطيل رسائل الخطأ المزعجة (debug: 0) وإعادة التنشيط الصامت التلقائي
+  useEffect(() => {
+    // إذا كان هناك اتصال WebRTC نشط بالفعل، لا نعيد تهيئة PeerJS
+    if (connRef.current && connRef.current.open) {
+      return;
+    }
+
+    let isUnmounted = false;
 
     const peer = new Peer(`${PEER_PREFIX}${myPin}`, {
-      debug: 1,
+      debug: 0, // منع PeerJS من طباعة ERROR PeerJS: Lost connection to server في Console
+      pingInterval: 5000, // إرسال نبضات كل 5 ثوانٍ للحفاظ على اتصال WebSocket نشطاً
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
           { urls: 'stun:global.stun.twilio.com:3478' },
         ],
       },
@@ -302,64 +557,127 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
 
     peerRef.current = peer;
 
-    peer.on('open', () => {
-      setStatus('ready');
-      setStatusMessage('جاهز للاتصال المحلي — شارك رمز الـ PIN أو امسح رمز الـ QR');
+    const scheduleSilentReinit = (delayMs = 1800) => {
+      if (isUnmounted) return;
+      if (connRef.current && connRef.current.open) return;
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      reconnectTimerRef.current = window.setTimeout(() => {
+        if (!isUnmounted && (!connRef.current || !connRef.current.open)) {
+          setSignalingEpoch((prev) => prev + 1);
+        }
+      }, delayMs);
+    };
 
-      // التحقق مما إذا كان الرابط يحتوي على رمز PIN للإقران التلقائي عبر مسح الكاميرا
+    peer.on('open', () => {
+      if (isUnmounted) return;
+      if (!connRef.current || !connRef.current.open) {
+        setStatus('ready');
+        setStatusMessage('جاهز للاتصال المحلي — شارك رمز الـ PIN أو امسح رمز الـ QR');
+      }
+
+      // إذا كان هناك طلب اتصال معلق (ضغط المستخدم على اتصال أثناء إعادة تنشيط الإشارة)، ننفذه فوراً
+      if (pendingConnectPinRef.current) {
+        const pinToRun = pendingConnectPinRef.current;
+        pendingConnectPinRef.current = null;
+        setTimeout(() => {
+          connectToPeerRef.current(pinToRun);
+        }, 150);
+        return;
+      }
+
+      // إذا تم فتح التطبيق عبر مسح رمز QR يحتوي على ?pin=XXXXXX، نتصل بالجهاز المقابل تلقائياً
       const params = new URLSearchParams(window.location.search);
-      const urlPin = params.get('pin');
-      if (urlPin && /^\d{6}$/.test(urlPin) && urlPin !== myPin) {
+      const urlPin = normalizePinDigits(params.get('pin') || '');
+      if (urlPin.length === 6 && urlPin !== myPin) {
         setTargetPin(urlPin);
+        // إزالة المعامل من الرابط بعد قراءته لعدم تكرار الاتصال
+        window.history.replaceState({}, '', window.location.pathname);
+        setTimeout(() => {
+          connectToPeerRef.current(urlPin);
+        }, 300);
       }
     });
 
     peer.on('connection', (conn) => {
-      connRef.current = conn;
-      isLoopbackModeRef.current = false;
+      if (isUnmounted) return;
       const remotePin = conn.peer.replace(PEER_PREFIX, '');
+      setupDataConnection(conn, remotePin);
+    });
 
-      conn.on('open', () => {
-        setStatus('connected');
-        setConnectedPeerPin(remotePin);
-        setStatusMessage(`متصل مباشرة عبر WebRTC بالجهاز رقم (${remotePin})`);
-      });
-
-      conn.on('data', (data) => {
-        handleIncomingData(data);
-      });
-
-      conn.on('close', () => {
-        setStatus('ready');
-        setConnectedPeerPin(null);
-        setStatusMessage('انتهت جلسة الاتصال مع الجهاز المقابل — جاهز لاتصال جديد');
-      });
-
-      conn.on('error', () => {
-        setStatus('error');
-        setStatusMessage('حدث خطأ أثناء نقل البيانات عبر القناة المحلية');
-      });
+    peer.on('disconnected', () => {
+      if (isUnmounted) return;
+      // عند انقطاع خادم الإشارة السحابي مؤقتاً، نعيد تهيئة جلسة الإشارة بهدوء بنفس رمز الـ PIN
+      scheduleSilentReinit(1500);
     });
 
     peer.on('error', (err) => {
+      if (isUnmounted) return;
+
       if (err.type === 'unavailable-id') {
-        // في حال مصادفة رقم PIN مستخدم، نولد رقماً جديداً تلقائياً
-        setMyPin(Math.floor(100000 + Math.random() * 900000).toString());
+        // إذا كان المعرف محجوزاً في جلسة سابقة لم تغلق بعد، نعيد المحاولة بعد ثانيتين بنفس الرمز
+        scheduleSilentReinit(2200);
       } else if (err.type === 'peer-unavailable') {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
         setStatus('ready');
-        setStatusMessage('لم يتم العثور على جهاز متصل بهذا الرمز — تأكد من الرقم وحاول مجدداً');
+        setStatusMessage(
+          'الجهاز المقابل غير متصل حالياً أو الرمز غير صحيح — تأكد من فتح الصفحة على الجهاز الآخر'
+        );
+      } else if (
+        err.type === 'network' ||
+        err.type === 'server-error' ||
+        err.type === 'socket-error' ||
+        err.type === 'socket-closed'
+      ) {
+        // معالجة صامتة لانقطاع خادم الإشارة (Lost connection to server) وإعادة التسجيل تلقائياً
+        scheduleSilentReinit(1500);
       } else {
         setStatus('ready');
-        setStatusMessage('وضع الشبكة المحلية جاهز (يدعم WebRTC و BroadcastChannel)');
       }
     });
 
-    // إعداد قناة BroadcastChannel لدعم الاتصال المباشر بين نوافذ المتصفح على نفس الجهاز بدون إنترنت
+    // إعادة تنشيط الاتصال فوراً عند عودة المستخدم إلى نافذة المتصفح على الهاتف أو الكمبيوتر
+    const handleVisibilityOrOnline = () => {
+      if (document.visibilityState === 'visible') {
+        if (!peer.open || peer.disconnected || peer.destroyed) {
+          scheduleSilentReinit(300);
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityOrOnline);
+    window.addEventListener('online', handleVisibilityOrOnline);
+
+    return () => {
+      isUnmounted = true;
+      document.removeEventListener('visibilitychange', handleVisibilityOrOnline);
+      window.removeEventListener('online', handleVisibilityOrOnline);
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      try {
+        peer.destroy();
+      } catch {
+        // تجاهل
+      }
+    };
+  }, [myPin, signalingEpoch, setupDataConnection]);
+
+  // إعداد قناة BroadcastChannel المستقلة لدعم الاتصال الفوري بين النوافذ على نفس الجهاز
+  useEffect(() => {
     const bc = new BroadcastChannel('localshare_p2p_lan_channel');
     broadcastRef.current = bc;
     bc.onmessage = (event) => {
       const msg = event.data;
       if (msg?.type === 'LOCAL_PAIR_REQUEST' && msg.targetPin === myPin) {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
         isLoopbackModeRef.current = true;
         setStatus('connected');
         setConnectedPeerPin(msg.senderPin);
@@ -370,6 +688,10 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
           senderPin: myPin,
         });
       } else if (msg?.type === 'LOCAL_PAIR_ACCEPTED' && msg.targetPin === myPin) {
+        if (connectTimeoutRef.current) {
+          window.clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = null;
+        }
         isLoopbackModeRef.current = true;
         setStatus('connected');
         setConnectedPeerPin(msg.senderPin);
@@ -379,67 +701,38 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
       }
     };
 
+    // نبضات اتصال دورية (Keep-Alive Ping) للحفاظ على نشاط قناة البيانات بين الهاتف والكمبيوتر
+    const keepAliveTimer = window.setInterval(() => {
+      if (connRef.current && connRef.current.open) {
+        try {
+          connRef.current.send({ type: 'PING', timestamp: Date.now() });
+        } catch {
+          // تجاهل
+        }
+      }
+    }, 10000);
+
     return () => {
+      window.clearInterval(keepAliveTimer);
       bc.close();
-      peer.destroy();
     };
   }, [myPin, handleIncomingData]);
 
-  // الاتصال بجهاز آخر عبر رمز PIN المكون من 6 أرقام
-  const connectToPeer = useCallback(
-    (pinToConnect?: string) => {
-      const cleanPin = (pinToConnect ?? targetPin).trim();
-      if (!/^\d{6}$/.test(cleanPin)) {
-        setStatusMessage('يرجى إدخال رمز PIN صحيح مكون من 6 أرقام');
-        return;
+  // قطع الاتصال الحالي يدوياً
+  const disconnectPeer = () => {
+    if (connRef.current) {
+      try {
+        connRef.current.close();
+      } catch {
+        // تجاهل
       }
-
-      if (cleanPin === myPin) {
-        // تفعيل وضع الاختبار المحلي الفوري على نفس الجهاز
-        isLoopbackModeRef.current = true;
-        setStatus('connected');
-        setConnectedPeerPin(`${myPin} (محلي)`);
-        setStatusMessage('تم تفعيل وضع النقل المحلي الفوري (Loopback P2P) لاختبار السرعة والتقسيم');
-        return;
-      }
-
-      setStatus('connecting');
-      setStatusMessage(`جاري البحث والاقتران بالجهاز (${cleanPin})...`);
-
-      // إرسال طلب إقران عبر BroadcastChannel للنوافذ المحلية أولاً
-      broadcastRef.current?.postMessage({
-        type: 'LOCAL_PAIR_REQUEST',
-        targetPin: cleanPin,
-        senderPin: myPin,
-      });
-
-      // فتح اتصال WebRTC DataChannel عبر PeerJS
-      if (peerRef.current && !peerRef.current.disconnected) {
-        const conn = peerRef.current.connect(`${PEER_PREFIX}${cleanPin}`, {
-          reliable: true,
-        });
-        connRef.current = conn;
-
-        conn.on('open', () => {
-          isLoopbackModeRef.current = false;
-          setStatus('connected');
-          setConnectedPeerPin(cleanPin);
-          setStatusMessage(`متصل بنجاح عبر WebRTC بالجهاز (${cleanPin})`);
-        });
-
-        conn.on('data', (data) => {
-          handleIncomingData(data);
-        });
-
-        conn.on('close', () => {
-          setStatus('ready');
-          setConnectedPeerPin(null);
-          setStatusMessage('تم إغلاق الاتصال من قِبل الطرف الآخر');
-        });
-      }
-    },
-    [targetPin, myPin, handleIncomingData]
-  );
+      connRef.current = null;
+    }
+    isLoopbackModeRef.current = false;
+    setStatus('ready');
+    setConnectedPeerPin(null);
+    setStatusMessage('تم قطع الاتصال يدوياً — الجهاز جاهز لاتصال جديد');
+  };
 
   // إيقاف الكاميرا عند إغلاق نافذة الماسح الضوئي
   const stopScanner = useCallback(() => {
@@ -488,7 +781,6 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
               });
 
               if (code && code.data) {
-                // استخراج رمز الـ PIN المكون من 6 أرقام من النص أو الرابط الممسوح
                 const match = code.data.match(/\b(\d{6})\b/);
                 if (match) {
                   const detectedPin = match[1];
@@ -512,7 +804,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
     }
   };
 
-  // مسح رمز QR من ملف صورة محفوظ على الجهاز (بديل عملي لأجهزة سطح المكتب بدون كاميرا)
+  // مسح رمز QR من ملف صورة محفوظ على الجهاز
   const handleQrImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -549,9 +841,11 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
 
   // خوارزمية تقسيم وإرسال الملف عبر WebRTC مع دعم الإيقاف المؤقت (Pause) والاستئناف (Resume)
   const sendFileInChunks = async (file: File) => {
-    // إذا لم يكن متصلاً بجهاز آخر، نفعل وضع النقل المحلي الفوري حتى يتمكن المستخدم من تجربة النقل والتقسيم مباشرة
-    const isDirectLoopback = status !== 'connected' || isLoopbackModeRef.current;
-    if (status !== 'connected') {
+    const hasOpenRtc = !!(connRef.current && connRef.current.open);
+    const isDirectSelfLoopback =
+      !hasOpenRtc && (!isLoopbackModeRef.current || connectedPeerPin?.includes('محلي'));
+
+    if (!hasOpenRtc && !isLoopbackModeRef.current) {
       isLoopbackModeRef.current = true;
       setStatus('connected');
       setConnectedPeerPin(`${myPin} (نقل محلي فوري)`);
@@ -561,7 +855,6 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
     const transferId = `tx-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE) || 1;
 
-    // إضافة عملية الإرسال إلى الواجهة
     setTransfers((prev) => [
       {
         id: transferId,
@@ -589,7 +882,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
     };
 
     sendPacket(metaPacket);
-    if (isDirectLoopback) {
+    if (isDirectSelfLoopback) {
       handleIncomingData(metaPacket);
     }
 
@@ -599,38 +892,37 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
     let bytesSinceLastSpeed = 0;
 
     while (offset < file.size) {
-      // التحقق مما إذا تم إلغاء النقل
       if (cancelledTransfersRef.current.has(transferId)) {
         return;
       }
 
-      // الانتظار أثناء الإيقاف المؤقت (Suspend / Pause) دون فقدان حالة الجزء الحالي
       while (pausedTransfersRef.current.has(transferId)) {
         if (cancelledTransfersRef.current.has(transferId)) return;
         await new Promise((r) => setTimeout(r, 120));
       }
 
-      // التحكم في ضغط البيانات (Backpressure) لقناة WebRTC لمنع امتلاء الذاكرة في الفيديوهات الكبيرة
+      // التحكم في ضغط البيانات (Backpressure) لقناة WebRTC لمنع امتلاء الذاكرة
       const rawDataChannel = (
         connRef.current as unknown as { dataChannel?: RTCDataChannel }
       )?.dataChannel;
-      if (rawDataChannel && rawDataChannel.bufferedAmount > 4 * 1024 * 1024) {
+      if (rawDataChannel && rawDataChannel.bufferedAmount > 2 * 1024 * 1024) {
         await new Promise((r) => setTimeout(r, 25));
         continue;
       }
 
       const slice = file.slice(offset, offset + CHUNK_SIZE);
       const arrayBuffer = await slice.arrayBuffer();
+      const base64Data = arrayBufferToBase64(arrayBuffer);
 
       const chunkPacket: SignalingDataPacket = {
         type: 'FILE_CHUNK',
         transferId,
         chunkIndex,
-        data: arrayBuffer,
+        data: base64Data,
       };
 
       sendPacket(chunkPacket);
-      if (isDirectLoopback) {
+      if (isDirectSelfLoopback) {
         handleIncomingData(chunkPacket);
       }
 
@@ -662,18 +954,16 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
           )
         );
 
-        // إتاحة دورة تحديث للواجهة الرسومية وشريط التقدم
-        await new Promise((r) => setTimeout(r, 12));
+        await new Promise((r) => setTimeout(r, 10));
       }
     }
 
-    // إرسال إشارة اكتمال جميع أجزاء الملف
     const completePacket: SignalingDataPacket = {
       type: 'FILE_COMPLETE',
       transferId,
     };
     sendPacket(completePacket);
-    if (isDirectLoopback) {
+    if (isDirectSelfLoopback) {
       handleIncomingData(completePacket);
     }
 
@@ -758,7 +1048,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
       setCopiedPin(true);
       setTimeout(() => setCopiedPin(false), 2000);
     } catch {
-      // تجاهل في حال عدم توفر صلاحية الحافظة
+      // تجاهل
     }
   };
 
@@ -821,16 +1111,27 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
                 عرض الملفات المستلمة ({receivedCount})
               </button>
             )}
-            <button
-              onClick={() =>
-                setMyPin(Math.floor(100000 + Math.random() * 900000).toString())
-              }
-              className="fluent-edge-btn flex items-center gap-1.5 px-3 py-2 rounded-sm bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border border-slate-600/60 text-xs font-medium cursor-pointer whitespace-nowrap"
-              title="توليد رمز PIN جديد"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              <span>تجديد الرمز</span>
-            </button>
+
+            {status === 'connected' ? (
+              <button
+                onClick={disconnectPeer}
+                className="fluent-edge-btn flex items-center gap-1.5 px-3 py-2 rounded-sm bg-rose-950/60 hover:bg-rose-900/70 text-rose-200 border border-rose-700/60 text-xs font-medium cursor-pointer whitespace-nowrap"
+              >
+                <Unplug className="w-3.5 h-3.5" />
+                <span>قطع الاتصال</span>
+              </button>
+            ) : (
+              <button
+                onClick={() =>
+                  setMyPin(Math.floor(100000 + Math.random() * 900000).toString())
+                }
+                className="fluent-edge-btn flex items-center gap-1.5 px-3 py-2 rounded-sm bg-slate-800/80 hover:bg-slate-700/80 text-slate-200 border border-slate-600/60 text-xs font-medium cursor-pointer whitespace-nowrap"
+                title="توليد رمز PIN جديد"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>تجديد الرمز</span>
+              </button>
+            )}
           </div>
         </div>
       </FluentCard>
@@ -863,7 +1164,8 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
                 />
               </div>
               <span className="text-xs text-slate-400 mt-2.5">
-                يتضمن رمز الإقران المباشر: <strong className="font-mono text-slate-200">{myPin}</strong>
+                يتضمن رمز الإقران المباشر:{' '}
+                <strong className="font-mono text-slate-200">{myPin}</strong>
               </span>
             </div>
           </div>
@@ -910,7 +1212,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
                   02. الربط وإرسال الملفات والفيديوهات
                 </h2>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  أدخل رمز الجهاز المقابل (6 أرقام) أو امسح رمز الـ QR بالكاميرا
+                  أدخل رمز الجهاز المقابل (6 أرقام) ثم اضغط &quot;اتصال مباشر&quot; أو امسح رمز الـ QR
                 </p>
               </div>
               <Link2 className="w-5 h-5 text-sky-400 shrink-0" />
@@ -928,9 +1230,13 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
                   maxLength={6}
                   dir="ltr"
                   value={targetPin}
-                  onChange={(e) =>
-                    setTargetPin(e.target.value.replace(/\D/g, '').slice(0, 6))
-                  }
+                  onChange={(e) => setTargetPin(normalizePinDigits(e.target.value))}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      connectToPeer();
+                    }
+                  }}
                   placeholder="000000"
                   className="w-full h-11 px-4 rounded-sm bg-slate-950/90 border border-slate-700 focus:border-sky-400 focus:outline-none font-mono text-lg tracking-[0.25em] text-center text-white tabular-nums"
                 />
@@ -939,10 +1245,11 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
               <div className="sm:col-span-3 flex items-end">
                 <button
                   onClick={() => connectToPeer()}
-                  className="fluent-edge-btn w-full h-11 px-4 rounded-sm bg-sky-600 hover:bg-sky-500 text-white font-semibold text-xs border border-sky-400/50 flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
+                  disabled={status === 'connecting'}
+                  className="fluent-edge-btn w-full h-11 px-4 rounded-sm bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white font-semibold text-xs border border-sky-400/50 flex items-center justify-center gap-2 cursor-pointer whitespace-nowrap"
                 >
                   <Zap className="w-4 h-4 shrink-0" />
-                  <span>اتصال مباشر</span>
+                  <span>{status === 'connecting' ? 'جاري الربط...' : 'اتصال مباشر'}</span>
                 </button>
               </div>
 
@@ -1055,7 +1362,7 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
 
           <div className="mt-4 pt-3 border-t border-slate-700/60 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
             <span>
-              نصيحة: يمكنك أيضاً تجربة إرسال أي ملف أو فيديو الآن مباشرة لمعاينة سرعة التقسيم ولوحة الملفات.
+              للربط بين جهازين: افتح التطبيق على الجهازين وأدخل رمز أحد الجهازين في الآخر واضغط &quot;اتصال مباشر&quot;.
             </span>
             <button
               onClick={() => {
@@ -1101,7 +1408,10 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
             {transfers.map((item) => {
               const progressPercent =
                 item.fileSize > 0
-                  ? Math.min(100, Math.round((item.transferredBytes / item.fileSize) * 100))
+                  ? Math.min(
+                      100,
+                      Math.round((item.transferredBytes / item.fileSize) * 100)
+                    )
                   : 100;
 
               return (
@@ -1135,7 +1445,8 @@ export const ConnectionManager: React.FC<ConnectionManagerProps> = ({
                         </div>
                         <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 font-mono tabular-nums mt-0.5">
                           <span>
-                            {formatBytes(item.transferredBytes)} / {formatBytes(item.fileSize)}
+                            {formatBytes(item.transferredBytes)} /{' '}
+                            {formatBytes(item.fileSize)}
                           </span>
                           <span aria-hidden="true">·</span>
                           <span>

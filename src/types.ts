@@ -42,6 +42,22 @@ export interface ReceivedFileItem {
 // رسائل البروتوكول المتبادلة عبر قناة البيانات (RTCDataChannel)
 export type SignalingDataPacket =
   | {
+      type: 'HANDSHAKE_SYN';
+      senderPin: string;
+    }
+  | {
+      type: 'HANDSHAKE_ACK';
+      senderPin: string;
+    }
+  | {
+      type: 'PING';
+      timestamp: number;
+    }
+  | {
+      type: 'PONG';
+      timestamp: number;
+    }
+  | {
       type: 'FILE_META';
       transferId: string;
       fileName: string;
@@ -53,7 +69,7 @@ export type SignalingDataPacket =
       type: 'FILE_CHUNK';
       transferId: string;
       chunkIndex: number;
-      data: ArrayBuffer | Uint8Array | string; // يدعم Binary ArrayBuffer أو Base64 عند الحاجة
+      data: ArrayBuffer | Uint8Array | string; // يدعم Binary ArrayBuffer أو Base64 لضمان التوافق بين كافة المتصفحات
     }
   | {
       type: 'TRANSFER_CONTROL';

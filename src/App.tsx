@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Share2,
@@ -11,11 +11,8 @@ import {
   Terminal,
   Menu,
   X,
-  Clock,
-  Calendar,
   ShieldCheck,
   Wifi,
-  Sparkles,
   Laptop,
 } from 'lucide-react';
 import { ReceivedFileItem } from './types';
@@ -24,12 +21,13 @@ import { FileDashboard } from './components/FileDashboard';
 import { SetupCodeGuide } from './components/SetupCodeGuide';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { FluentCard } from './components/FluentCard';
+import { LiveClock } from './components/LiveClock';
 
 type ActiveSection = 'transfer' | 'files' | 'guide';
 
 /**
  * المكون الرئيسي للتطبيق (App.tsx)
- * يضم الشريط الإخباري العلوي المتحرك (Marquee)، الساعة الحية في أعلى اليسار بنظام 12 ساعة،
+ * يضم الشريط الإخباري العلوي المتحرك (Marquee)، الساعة الحية المعزولة في أعلى اليسار بنظام 12 ساعة،
  * القائمة الجانبية المتجاوبة بنمط Windows 10 Fluent Design، ومحرك النقل المحلي WebRTC.
  */
 export default function App() {
@@ -38,21 +36,10 @@ export default function App() {
 
   // حالة فتح/إغلاق القائمة الجانبية على شاشات الهاتف (مخفية افتراضياً على الجوال)
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);
-  const sidebarRef = useRef<HTMLSelectElement | HTMLElement | null>(null);
-
-  // حالة الساعة الحية (اليوم، التاريخ، والوقت بنظام 12 ساعة مع ص/م يتحدث كل ثانية)
-  const [now, setNow] = useState<Date>(() => new Date());
+  const sidebarRef = useRef<HTMLElement | null>(null);
 
   // قائمة الملفات والفيديوهات المستلمة محلياً
   const [receivedFiles, setReceivedFiles] = useState<ReceivedFileItem[]>([]);
-
-  // تحديث الساعة الحية كل ثانية بالضبط
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setNow(new Date());
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
 
   // إغلاق القائمة الجانبية تلقائياً على الهاتف عند النقر في أي مكان خارجها
   useEffect(() => {
@@ -75,45 +62,30 @@ export default function App() {
     };
   }, [isMobileSidebarOpen]);
 
-  // تنسيق بيانات الساعة الحية (اليوم، التاريخ، الوقت 12 ساعة مع AM/PM)
-  const dayName = now.toLocaleDateString('ar-SA', { weekday: 'long' });
-  const formattedDate = now.toLocaleDateString('en-GB', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-  const formattedTime12h = now.toLocaleTimeString('en-US', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true,
-  });
-
-  // إضافة ملف مستلم جديد إلى لوحة الملفات
-  const handleFileReceived = (file: ReceivedFileItem) => {
+  // إضافة ملف مستلم جديد إلى لوحة الملفات (مغلفة بـ useCallback لضمان استقرار المرجع)
+  const handleFileReceived = useCallback((file: ReceivedFileItem) => {
     setReceivedFiles((prev) => [file, ...prev]);
-  };
+  }, []);
 
   // تبديل حالة تحديد ملف واحد
-  const handleToggleSelect = (id: string) => {
+  const handleToggleSelect = useCallback((id: string) => {
     setReceivedFiles((prev) =>
       prev.map((file) =>
         file.id === id ? { ...file, selected: !file.selected } : file
       )
     );
-  };
+  }, []);
 
   // تحديد أو إلغاء تحديد جميع الملفات المستلمة
-  const handleSelectAll = () => {
-    const allSelected =
-      receivedFiles.length > 0 && receivedFiles.every((f) => f.selected);
-    setReceivedFiles((prev) =>
-      prev.map((file) => ({ ...file, selected: !allSelected }))
-    );
-  };
+  const handleSelectAll = useCallback(() => {
+    setReceivedFiles((prev) => {
+      const allSelected = prev.length > 0 && prev.every((f) => f.selected);
+      return prev.map((file) => ({ ...file, selected: !allSelected }));
+    });
+  }, []);
 
   // حذف الملفات المحددة من الواجهة المحلية وتحرير عناوين الذاكرة المؤقتة (Blob URLs)
-  const handleDeleteSelected = () => {
+  const handleDeleteSelected = useCallback(() => {
     setReceivedFiles((prev) => {
       prev.forEach((file) => {
         if (file.selected && file.blobUrl) {
@@ -122,7 +94,7 @@ export default function App() {
       });
       return prev.filter((file) => !file.selected);
     });
-  };
+  }, []);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#0A1128] text-slate-100 select-none sm:select-auto">
@@ -178,30 +150,7 @@ export default function App() {
           {/* الجهة اليسرى (Top-Left below Marquee): الساعة الحية بنظام 12 ساعة مع AM/PM + زر تثبيت PWA */}
           <div className="flex items-center gap-3 mr-auto sm:mr-0">
             <PWAInstallButton />
-
-            {/* الساعة الحية (Top-Left Live Clock): تعرض اليوم، التاريخ، والوقت 12-Hour مع AM/PM */}
-            <FluentCard className="px-3.5 py-2 bg-slate-950/85 border border-slate-700/80">
-              <div className="flex items-center gap-3 text-xs">
-                <div className="flex items-center gap-1.5 text-sky-300 font-semibold">
-                  <Calendar className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <span>{dayName}</span>
-                  <span aria-hidden="true">·</span>
-                  <span dir="ltr" className="font-mono tabular-nums text-slate-200">
-                    {formattedDate}
-                  </span>
-                </div>
-                <span className="text-slate-600" aria-hidden="true">|</span>
-                <div className="flex items-center gap-1.5">
-                  <Clock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span
-                    dir="ltr"
-                    className="font-mono font-bold text-xs sm:text-sm text-white tabular-nums tracking-wider"
-                  >
-                    {formattedTime12h}
-                  </span>
-                </div>
-              </div>
-            </FluentCard>
+            <LiveClock />
           </div>
         </div>
       </header>
@@ -275,7 +224,7 @@ export default function App() {
                 <Laptop className="w-3.5 h-3.5 text-sky-400" />
                 <span>Windows 10 Fluent</span>
               </span>
-              <span className="font-mono text-sky-400">WebRTC v1</span>
+              <span className="font-mono text-sky-400">WebRTC v2</span>
             </div>
           </FluentCard>
         </aside>
@@ -291,7 +240,7 @@ export default function App() {
               className="fixed inset-0 z-50 bg-black/65 backdrop-blur-xs lg:hidden flex"
             >
               <motion.aside
-                ref={sidebarRef as React.RefObject<HTMLElement>}
+                ref={sidebarRef}
                 initial={{ x: '100%' }}
                 animate={{ x: 0 }}
                 exit={{ x: '100%' }}
@@ -380,33 +329,40 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* منطقة المحتوى الرئيسية */}
+        {/* منطقة المحتوى الرئيسية: إبقاء ConnectionManager نشطاً في الذاكرة حتى عند التبديل بين التبويبات لعدم قطع الاتصال */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 min-w-0">
-          <motion.div
-            key={activeSection}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.16 }}
-          >
-            {activeSection === 'transfer' && (
-              <ConnectionManager
-                onFileReceived={handleFileReceived}
-                receivedCount={receivedFiles.length}
-                onNavigateToFiles={() => setActiveSection('files')}
-              />
-            )}
+          <div className={activeSection === 'transfer' ? 'block' : 'hidden'}>
+            <ConnectionManager
+              onFileReceived={handleFileReceived}
+              receivedCount={receivedFiles.length}
+              onNavigateToFiles={() => setActiveSection('files')}
+            />
+          </div>
 
-            {activeSection === 'files' && (
+          {activeSection === 'files' && (
+            <motion.div
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.16 }}
+            >
               <FileDashboard
                 files={receivedFiles}
                 onToggleSelect={handleToggleSelect}
                 onSelectAll={handleSelectAll}
                 onDeleteSelected={handleDeleteSelected}
               />
-            )}
+            </motion.div>
+          )}
 
-            {activeSection === 'guide' && <SetupCodeGuide />}
-          </motion.div>
+          {activeSection === 'guide' && (
+            <motion.div
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.16 }}
+            >
+              <SetupCodeGuide />
+            </motion.div>
+          )}
         </main>
       </div>
     </div>
