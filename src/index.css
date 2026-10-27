@@ -1,0 +1,148 @@
+@import "tailwindcss";
+
+@theme {
+  /* خطوط الواجهة العربية والأرقام الجدولية المتناسقة */
+  --font-sans: "Cairo", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* لوحة الألوان: الكحلي العصري (Navy Blue) والرصاصي (Slate Gray) بنمط Windows 10 Fluent */
+  --color-navy-950: #060B19;
+  --color-navy-900: #0A1128;
+  --color-navy-800: #111C38;
+  --color-navy-700: #1B2B52;
+  --color-slate-850: #162032;
+  --color-fluent-accent: #38BDF8;
+  --color-fluent-glow: rgba(56, 189, 248, 0.38);
+}
+
+/* إعدادات أساسية للخطوط والأرقام المتساوية العرض لمنع الاهتزاز */
+body {
+  font-family: var(--font-sans);
+  background-color: #0A1128;
+  color: #F1F5F9;
+  overflow-x: hidden;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* حركة الشريط الإخباري العلوي (Marquee) بسرعة متوسطة ومستمرة */
+@keyframes marquee-rtl {
+  0% {
+    transform: translate3d(-100%, 0, 0);
+  }
+  100% {
+    transform: translate3d(100%, 0, 0);
+  }
+}
+
+.animate-marquee-medium {
+  display: flex;
+  width: max-content;
+  animation: marquee-rtl 34s linear infinite;
+}
+
+.animate-marquee-medium:hover {
+  animation-play-state: paused;
+}
+
+/* تأثير إضاءة الحواف التفاعلي (Windows 10 Fluent Edge Lighting / Reveal Highlight)
+   يعمل عند تمرير الماوس (Hover) أو اللمس بالإصبع (Touch) على أي قسم أو بطاقة أو زر */
+.fluent-edge-card {
+  position: relative;
+  background: rgba(22, 32, 50, 0.72);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms ease, box-shadow 150ms ease;
+  overflow: hidden;
+}
+
+.fluent-edge-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    420px circle at var(--mouse-x, 50%) var(--mouse-y, 50%),
+    rgba(56, 189, 248, 0.16),
+    transparent 65%
+  );
+  opacity: 0;
+  transition: opacity 150ms ease;
+  z-index: 0;
+}
+
+.fluent-edge-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: radial-gradient(
+    280px circle at var(--mouse-x, 50%) var(--mouse-y, 50%),
+    rgba(56, 189, 248, 0.85),
+    rgba(148, 163, 184, 0.15) 55%,
+    transparent 80%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  z-index: 1;
+}
+
+.fluent-edge-card:hover::before,
+.fluent-edge-card:hover::after,
+.fluent-edge-card:active::before,
+.fluent-edge-card:active::after,
+.fluent-edge-card.touch-active::before,
+.fluent-edge-card.touch-active::after {
+  opacity: 1;
+}
+
+.fluent-edge-card:hover,
+.fluent-edge-card.touch-active {
+  border-color: rgba(56, 189, 248, 0.45);
+  box-shadow: 0 0 24px -4px rgba(56, 189, 248, 0.22);
+}
+
+/* تأثير إضاءة الحواف للأزرار التفاعلية (Fluent Reveal Button) */
+.fluent-edge-btn {
+  position: relative;
+  overflow: hidden;
+  transition: transform 120ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 150ms ease, border-color 150ms ease, background-color 150ms ease;
+}
+
+.fluent-edge-btn:hover,
+.fluent-edge-btn:focus-visible,
+.fluent-edge-btn:active {
+  border-color: rgba(56, 189, 248, 0.85);
+  box-shadow: 0 0 18px rgba(56, 189, 248, 0.38), inset 0 0 12px rgba(56, 189, 248, 0.18);
+}
+
+.fluent-edge-btn:active {
+  transform: scale(0.98);
+}
+
+/* تخصيص شريط التمرير بأسلوب Windows 10 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0A1128;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #38BDF8;
+}

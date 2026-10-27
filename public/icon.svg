@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="navyGrad" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0A1128" />
+      <stop offset="50%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#0F172A" />
+    </linearGradient>
+    <linearGradient id="accentGlow" x1="96" y1="96" x2="416" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#0284C7" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="url(#navyGrad)" />
+  <rect x="24" y="24" width="464" height="464" rx="76" stroke="#38BDF8" stroke-opacity="0.3" stroke-width="4" />
+  <path d="M160 208L256 112L352 208" stroke="url(#accentGlow)" stroke-width="32" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M256 120V320" stroke="url(#accentGlow)" stroke-width="32" stroke-linecap="round" />
+  <path d="M128 320V368C128 385.673 142.327 400 160 400H352C369.673 400 384 385.673 384 368V320" stroke="#94A3B8" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="160" cy="144" r="16" fill="#38BDF8" />
+  <circle cx="352" cy="144" r="16" fill="#38BDF8" />
+</svg>

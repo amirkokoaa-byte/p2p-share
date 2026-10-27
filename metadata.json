@@ -1,0 +1,6 @@
+{
+  "name": "نقل الملفات المباشر P2P - LocalShare",
+  "description": "تطبيق ويب تقدمي (PWA) فائق السرعة وآمن 100% لنقل الملفات والفيديوهات محلياً عبر الواي فاي بتقنية WebRTC بتصميم Windows 10 Fluent Design.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
